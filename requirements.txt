@@ -1,4 +1,4 @@
 streamlit
 numpy
-matplotlib
+matplotlib>=3.9.2,<4.0
 time
