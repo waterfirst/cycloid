@@ -6,8 +6,7 @@ import plotly.graph_objects as go
 from concurrent.futures import ThreadPoolExecutor
 import datetime
 import time
-import json
-import numpy as np
+import requests
 
 # 페이지 기본 설정
 
@@ -142,30 +141,21 @@ def get_top_kr_etfs():
 
 
 @st.cache_data(ttl=3600)  # 1시간 캐시
-def calculate_technical_indicators(df):
+ef calculate_technical_indicators(df):
     """ETF의 기술적 지표를 계산합니다."""
-    if len(df) < 60:  # 최소 60일치 데이터 필요
+    if len(df) < 60:
         return None
 
     try:
         # 이동평균선
-        df["MA5"] = df["Close"].rolling(window=5).mean()
-        df["MA20"] = df["Close"].rolling(window=20).mean()
-        df["MA50"] = df["Close"].rolling(window=50).mean()
-        df["MA150"] = df["Close"].rolling(window=150).mean()
-        df["MA200"] = df["Close"].rolling(window=200).mean()
+        for window in [5, 20, 50, 150, 200]:
+            df[f"MA{window}"] = df["Close"].rolling(window=window).mean()
 
         # RSI 계산
         delta = df["Close"].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df["RSI"] = 100 - (100 / (1 + rs))
-
-        # 볼린저 밴드
-        df["MA20_std"] = df["Close"].rolling(window=20).std()
-        df["Upper_band"] = df["MA20"] + (df["MA20_std"] * 2)
-        df["Lower_band"] = df["MA20"] - (df["MA20_std"] * 2)
+        df["RSI"] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
         # MACD
         exp1 = df["Close"].ewm(span=12, adjust=False).mean()
@@ -173,51 +163,60 @@ def calculate_technical_indicators(df):
         df["MACD"] = exp1 - exp2
         df["Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
 
+        # 볼린저 밴드
+        df["MA20_std"] = df["Close"].rolling(window=20).std()
+        df["Upper_band"] = df["MA20"] + (df["MA20_std"] * 2)
+        df["Lower_band"] = df["MA20"] - (df["MA20_std"] * 2)
+
         return df
     except Exception as e:
         st.error(f"지표 계산 중 오류 발생: {str(e)}")
         return None
 
 
-def check_sepa_conditions(df):
+def check_sepa_conditions_etf(df):
     """SEPA 전략 조건을 확인합니다."""
-    if df is None or len(df) < 200:
-        return False, {}
+    if df is None or len(df) < 60:
+        return 0, {}
 
     try:
         latest = df.iloc[-1]
-        month_ago = df.iloc[-30]
-
-        # SEPA 조건 체크
-        criteria = {
-            "현재가가 200일선 위": latest["Close"] > latest["MA200"],
-            "150일선이 200일선 위": latest["MA150"] > latest["MA200"],
-            "50일선이 150/200일선 위": (latest["MA50"] > latest["MA150"])
-            and (latest["MA50"] > latest["MA200"]),
-            "현재가가 5일선 위": latest["Close"] > latest["MA5"],
-            "200일선 상승 추세": latest["MA200"] > month_ago["MA200"],
+        
+        # 기본 조건
+        base_criteria = {
+            "현재가 > MA200": latest["Close"] > latest["MA200"],
+            "MA50 > MA200": latest["MA50"] > latest["MA200"],
+            "현재가 > MA20": latest["Close"] > latest["MA20"],
+            "거래량 증가": df["Volume"].tail(20).mean() > df["Volume"].tail(60).mean()
+        }
+        
+        # 모멘텀 조건
+        momentum_criteria = {
+            "RSI > 50": latest["RSI"] > 50,
+            "MACD > Signal": latest["MACD"] > latest["Signal"],
+            "단기 상승추세": latest["MA5"] > latest["MA20"]
         }
 
-        # 52주 최저가 대비 상승률 계산
-        year_low = df["Low"].tail(252).min()
-        price_above_low = (latest["Close"] / year_low - 1) > 0.3
-        criteria["52주 최저가 대비 30% 이상"] = price_above_low
+        # 점수 계산
+        score = sum(base_criteria.values()) * 2 + sum(momentum_criteria.values())
+        max_score = (len(base_criteria) * 2 + len(momentum_criteria))
+        score_percentage = (score / max_score) * 100
 
-        all_conditions_met = all(criteria.values())
-
-        return all_conditions_met, criteria
+        all_criteria = {**base_criteria, **momentum_criteria}
+        
+        return score_percentage, all_criteria
 
     except Exception as e:
         st.error(f"SEPA 조건 체크 중 오류 발생: {str(e)}")
-        return False, {}
+        return 0, {}
 
 
 def analyze_etf(ticker):
-    """ETF 분석 함수 업데이트"""
+    """ETF 분석을 수행합니다."""
     try:
         etf = yf.Ticker(ticker)
         df = etf.history(period="1y")
-
+        
         if df.empty:
             return None
 
@@ -225,29 +224,27 @@ def analyze_etf(ticker):
         if df is None:
             return None
 
-        # SEPA 점수 및 조건 확인
-        sepa_score, sepa_conditions = check_sepa_conditions_etf(df)
-
-        info = etf.info
-        latest = df.iloc[-1]
-
         # 수익률 계산
-        returns = calculate_returns(df)
+        latest = df.iloc[-1]
+        returns = {}
+        for period, days in {"1개월": 20, "3개월": 60, "6개월": 120}.items():
+            if len(df) >= days:
+                returns[f"{period}수익률"] = ((latest["Close"] / df.iloc[-days]["Close"]) - 1) * 100
+            else:
+                returns[f"{period}수익률"] = 0
 
-        # 추가 기술적 지표
-        technical_indicators = calculate_additional_indicators(df)
+        # SEPA 점수 계산
+        sepa_score, sepa_conditions = check_sepa_conditions_etf(df)
 
         result = {
             "티커": ticker.replace(".KS", ""),
-            "ETF명": info.get("longName", "N/A"),
+            "ETF명": etf.info.get("longName", "N/A"),
             "현재가": latest["Close"],
             "SEPA_점수": sepa_score,
             "SEPA_조건": sepa_conditions,
-            "기술적_지표": technical_indicators,
             **returns,
-            "변동성": df["Close"].std(),
             "거래량": latest["Volume"],
-            "차트데이터": df,
+            "차트데이터": df
         }
 
         return result
@@ -307,41 +304,23 @@ def create_etf_chart(ticker, df):
             high=df["High"],
             low=df["Low"],
             close=df["Close"],
-            name="가격",
+            name="가격"
         )
     )
 
-    # 사용 가능한 이동평균선 추가
-    ma_colors = {"MA5": "purple", "MA20": "blue", "MA50": "green", "MA200": "red"}
-
-    for ma, color in ma_colors.items():
-        if ma in df.columns:  # 해당 컬럼이 있는 경우에만 추가
-            fig.add_trace(
-                go.Scatter(x=df.index, y=df[ma], name=ma, line=dict(color=color))
-            )
-
-    # 볼린저 밴드 추가 (있는 경우에만)
-    if "Upper_band" in df.columns and "Lower_band" in df.columns:
+    # 이동평균선
+    colors = {"MA5": "purple", "MA20": "blue", "MA50": "green", "MA200": "red"}
+    for ma, color in colors.items():
         fig.add_trace(
             go.Scatter(
                 x=df.index,
-                y=df["Upper_band"],
-                name="상단밴드",
-                line=dict(color="gray", dash="dash"),
+                y=df[ma],
+                name=ma,
+                line=dict(color=color)
             )
         )
 
-        fig.add_trace(
-            go.Scatter(
-                x=df.index,
-                y=df["Lower_band"],
-                name="하단밴드",
-                line=dict(color="gray", dash="dash"),
-                fill="tonexty",
-            )
-        )
-
-    # 거래량 차트 추가
+    # 거래량
     fig.add_trace(
         go.Bar(
             x=df.index,
@@ -349,24 +328,25 @@ def create_etf_chart(ticker, df):
             name="거래량",
             yaxis="y2",
             marker_color="lightgray",
-            opacity=0.5,
+            opacity=0.5
         )
     )
 
-    # 차트 레이아웃 설정
     fig.update_layout(
-        title=f"{ticker} 가격 차트",
+        title=f"{ticker} 차트",
         yaxis_title="가격",
         xaxis_title="날짜",
         height=600,
-        template="plotly_white",
-        yaxis2=dict(title="거래량", overlaying="y", side="right", showgrid=False),
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        yaxis2=dict(
+            title="거래량",
+            overlaying="y",
+            side="right",
+            showgrid=False
+        ),
+        showlegend=True
     )
 
     return fig
-
 
 def check_sepa_conditions_etf(df):
     """완화된 SEPA 전략 조건을 확인합니다."""
@@ -462,29 +442,25 @@ def main():
     st.title("국내 ETF SEPA 전략 분석 대시보드 📈")
     st.markdown("---")
 
-    # 세션 스테이트 초기화
     if "analyzed_results" not in st.session_state:
         st.session_state["analyzed_results"] = None
 
-    # 분석 시작 버튼
     if st.session_state["analyzed_results"] is None:
         if st.button("ETF 분석 시작"):
             with st.spinner("ETF 분석 중..."):
                 start_time = time.time()
-
-                # ETF 리스트 가져오기
+                
                 tickers = get_top_kr_etfs()
                 if not tickers:
-                    st.error("ETF 리스트를 가져오는데 실패했습니다.")
+                    st.error("ETF 목록을 가져오는데 실패했습니다.")
                     return
 
-                # 멀티스레딩으로 병렬 처리
                 analyzed_etfs = []
                 progress_bar = st.progress(0)
 
                 with ThreadPoolExecutor(max_workers=10) as executor:
                     future_to_etf = {
-                        executor.submit(analyze_etf, ticker): ticker
+                        executor.submit(analyze_etf, ticker): ticker 
                         for ticker in tickers
                     }
 
@@ -506,92 +482,59 @@ def main():
                     st.error("분석 가능한 ETF가 없습니다.")
                     return
 
-    # 분석 결과가 있는 경우 표시
     if st.session_state["analyzed_results"] is not None:
         df_results = st.session_state["analyzed_results"]
         top_10_etfs = df_results.head(10)
 
-        # 상위 10개 ETF 표시
         st.subheader("🏆 SEPA 전략 상위 10개 ETF")
 
-        # 선택 가능한 ETF 목록 생성
-        etf_options = [
-            f"{row['티커']} - {row['ETF명']}" for _, row in top_10_etfs.iterrows()
-        ]
-
+        # ETF 선택 옵션
+        etf_options = [f"{row['티커']} - {row['ETF명']}" for _, row in top_10_etfs.iterrows()]
         selected_etf = st.selectbox("분석할 ETF 선택", etf_options)
 
         if selected_etf:
-            # 선택된 ETF의 티커 추출
             selected_ticker = selected_etf.split(" - ")[0]
             etf_data = df_results[df_results["티커"] == selected_ticker].iloc[0]
 
             col1, col2 = st.columns([3, 1])
 
             with col1:
-                # 차트 표시
                 chart = create_etf_chart(etf_data["ETF명"], etf_data["차트데이터"])
                 st.plotly_chart(chart, use_container_width=True)
 
             with col2:
-                # ETF 정보 표시
                 st.subheader("📊 ETF 정보")
                 metrics = {
                     "현재가": f"₩{etf_data['현재가']:,.0f}",
                     "SEPA 점수": f"{etf_data['SEPA_점수']:.1f}점",
                     "1개월수익률": f"{etf_data['1개월수익률']:.2f}%",
                     "3개월수익률": f"{etf_data['3개월수익률']:.2f}%",
-                    "6개월수익률": f"{etf_data['6개월수익률']:.2f}%",
+                    "6개월수익률": f"{etf_data['6개월수익률']:.2f}%"
                 }
 
                 for key, value in metrics.items():
                     st.metric(key, value)
 
-                # SEPA 조건 충족 현황
                 st.markdown("#### 💡 SEPA 전략 조건")
                 if isinstance(etf_data["SEPA_조건"], dict):
-                    conditions_df = pd.DataFrame(
-                        {
-                            "조건": etf_data["SEPA_조건"].keys(),
-                            "충족여부": [
-                                "✅" if v else "❌"
-                                for v in etf_data["SEPA_조건"].values()
-                            ],
-                        }
-                    )
-                    st.dataframe(conditions_df)
+                    for condition, met in etf_data["SEPA_조건"].items():
+                        st.write(f"{'✅' if met else '❌'} {condition}")
 
-        # 상위 10개 ETF 테이블
         st.markdown("---")
         st.subheader("📋 SEPA 전략 상위 10개 ETF 목록")
 
-        display_cols = [
-            "티커",
-            "ETF명",
-            "현재가",
-            "SEPA_점수",
-            "1개월수익률",
-            "3개월수익률",
-            "6개월수익률",
-        ]
+        # 표시할 열 선택
+        display_cols = ["티커", "ETF명", "현재가", "SEPA_점수", "1개월수익률", "3개월수익률", "6개월수익률"]
+        
+        # 데이터프레임 포맷팅
+        display_df = top_10_etfs[display_cols].copy()
+        display_df["현재가"] = display_df["현재가"].apply(lambda x: f"{x:,.0f}원")
+        display_df["SEPA_점수"] = display_df["SEPA_점수"].apply(lambda x: f"{x:.1f}")
+        display_df["1개월수익률"] = display_df["1개월수익률"].apply(lambda x: f"{x:.2f}%")
+        display_df["3개월수익률"] = display_df["3개월수익률"].apply(lambda x: f"{x:.2f}%")
+        display_df["6개월수익률"] = display_df["6개월수익률"].apply(lambda x: f"{x:.2f}%")
 
-        # 스타일이 적용된 데이터프레임 표시
-        styled_df = (
-            top_10_etfs[display_cols]
-            .style.background_gradient(subset=["SEPA_점수"], cmap="RdYlGn")
-            .format(
-                {
-                    "현재가": "{:,.0f}₩",
-                    "SEPA_점수": "{:.1f}",
-                    "1개월수익률": "{:.2f}%",
-                    "3개월수익률": "{:.2f}%",
-                    "6개월수익률": "{:.2f}%",
-                }
-            )
-        )
-
-        st.dataframe(styled_df, use_container_width=True)
-
+        st.dataframe(display_df, use_container_width=True)
 
 if __name__ == "__main__":
     main()
